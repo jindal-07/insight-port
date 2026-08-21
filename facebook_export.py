@@ -277,7 +277,9 @@ class CSVWriter:
     def add_feed_insights(cls, feed_list: list):
         yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         for feed in feed_list:
-            message = (feed.get('message') or '')[:1000]
+            # Flatten newlines: multiline cells display only one line in
+            # Excel (pivot drill-through showed just the hashtag).
+            message = re.sub(r'\s*[\r\n]+\s*', ' ', feed.get('message') or '').strip()[:1000]
             cls._feed_insights.append({
                 'date':                 yesterday,
                 'page_id':              feed.get('page_id'),

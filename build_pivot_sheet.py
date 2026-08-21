@@ -112,9 +112,19 @@ _DATETIME_RE = re.compile(
 )
 
 
+_NEWLINES_RE = re.compile(r"\s*[\r\n]+\s*")
+
+
+def _flatten(s: str) -> str:
+    """Newlines -> single spaces. Multiline strings render as one line in a
+    cell, so Excel's pivot drill-through showed only the bottom line (the
+    hashtag) of multiline messages."""
+    return _NEWLINES_RE.sub(" ", s).strip()
+
+
 def _coerce(text: str) -> Any:
     """Turn a CSV string into the int / float / datetime / str Excel would infer."""
-    s = text.strip()
+    s = _flatten(text.strip())
     if not s:
         return None
     m = _DATETIME_RE.match(s)
@@ -221,8 +231,9 @@ def read_source(path: str, sheet_name: str | None):
 
 def _norm(v: Any) -> Any:
     """Empty strings behave as blanks, matching Excel's pivot cache."""
-    if isinstance(v, str) and not v.strip():
-        return None
+    if isinstance(v, str):
+        v = _flatten(v)
+        return v if v else None
     if isinstance(v, _dt.datetime):
         return v
     if isinstance(v, _dt.date):
