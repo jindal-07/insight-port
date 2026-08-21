@@ -1,0 +1,9 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Local export output (legacy — web exports never touch disk)
+facebook_export_csvs/
