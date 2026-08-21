@@ -7,5 +7,5 @@ services:
     envVars:
       - key: FB_USER_TOKEN
         sync: false   # prompted in the Render dashboard, never stored in git
-      - key: APP_PASSWORD
-        sync: false   # basic-auth password for the app (any username)
+      # Optional: add APP_PASSWORD in the Render dashboard (Environment tab)
+      # to put the app behind a password. Unset = open access.
