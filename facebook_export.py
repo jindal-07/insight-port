@@ -333,8 +333,9 @@ class CSVWriter:
 
     @staticmethod
     def _filenames():
-        return ('social_pages.csv', 'social_page_insights.csv',
-                FEED_INSIGHTS_FILENAME, 'social_feed.csv')
+        # Output paused for social_pages / social_page_insights / social_feed:
+        # only the feed insights CSV (and the pivot workbook) are written.
+        return (FEED_INSIGHTS_FILENAME,)
 
     # ------------------------------------------------------------ save all
     @classmethod
@@ -344,11 +345,10 @@ class CSVWriter:
         the buffers.  Safe to call repeatedly — uses append mode so rows from
         previous pages are never overwritten.
         """
+        # Only the feed insights CSV is written; the other buffers are still
+        # collected but their file output is paused.
         datasets = {
-            'social_pages.csv':         (cls._pages, PAGE_COLUMNS),
-            'social_page_insights.csv': (cls._page_insights, PAGE_INSIGHT_COLUMNS),
-            FEED_INSIGHTS_FILENAME:     (cls._feed_insights, FEED_COLUMNS),
-            'social_feed.csv':          (cls._custom_labels, LABEL_COLUMNS),
+            FEED_INSIGHTS_FILENAME: (cls._feed_insights, FEED_COLUMNS),
         }
 
         tag = f" [{label}]" if label else ""
@@ -512,10 +512,8 @@ class FacebookAPIClient:
         print(f"\n  Total pages found: {len(pages)}")
         print("=" * 80)
 
-        filepath = os.path.join(CSV_OUTPUT_DIR, 'accessible_pages.csv')
-        pd.DataFrame(pages).to_csv(filepath, index=False)
-        print(f"  💾 Saved to: {os.path.abspath(filepath)}\n")
-
+        # accessible_pages.csv output is paused — only the feed insights CSV
+        # and the pivot workbook are produced.
         return pages
 
     def get_page_basic_info(self, page_id, page_token):
@@ -839,41 +837,9 @@ try:
             print(f"\n📄 Processing page: {page_name}")
             print("=" * 60)
 
-            # ---- Page insights ----
-            try:
-                print("   📈 Fetching page insights...")
-                page_insights = client.get_page_insights(page_id, page_token)
-
-                insights_by_date = {}
-                for insight in page_insights:
-                    metric_name = insight.get('name')
-                    for value_data in insight.get('values', []):
-                        date = value_data.get('end_time', '').split('T')[0]
-                        value = value_data.get('value', 0)
-
-                        try:
-                            date_obj = datetime.strptime(date, '%Y-%m-%d')
-                            if date_obj >= (datetime.now() - timedelta(days=1)):
-                                continue
-                        except ValueError:
-                            continue
-
-                        if date not in insights_by_date:
-                            insights_by_date[date] = {
-                                'page_id': page_id, 'date': date,
-                                'follows': 0, 'impressions': 0,
-                                'post_engagements': 0,
-                                'monetization_approximate_earnings': 0.0,
-                            }
-
-                        clean_metric = metric_name.replace('page_', '')
-                        insights_by_date[date][clean_metric] = value
-
-                if insights_by_date:
-                    CSVWriter.add_page_insights(list(insights_by_date.values()))
-                    print(f"   ✅ Collected {len(insights_by_date)} page insight records")
-            except Exception as e:
-                print(f"   ❌ Error collecting page insights: {e}")
+            # ---- Page insights: PAUSED ----
+            # social_page_insights.csv output is disabled, so the per-page
+            # insights API calls are skipped entirely to save time/quota.
 
             # ---- Feed posts (threaded) ----
             try:

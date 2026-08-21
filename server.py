@@ -91,18 +91,21 @@ class ExportJob:
         self.params: dict | None = None
         self.started_at: str | None = None
         self.finished_at: str | None = None
-        # Results live in memory only — the export writes to a temp dir that
-        # is zipped into RAM and deleted the moment the run finishes.
+        # Results live in a per-run temp dir. Files are served straight from
+        # it as soon as they are complete (no ZIP buffering); the dir is
+        # replaced when the next run starts.
         self.out_dir: str | None = None
-        self.zip_bytes: bytes | None = None
-        self.zip_name: str | None = None
-        self.manifest: list[dict] = []
+        # Set when the exporter logs that the feed CSV is final (it starts
+        # building the pivot) — lets the CSV download before the run ends.
+        self.feed_csv_ready = False
 
     def start(self, params: dict) -> None:
         env = os.environ.copy()
         token = get_user_token()
         if token:
             env['FB_USER_TOKEN'] = token
+        if self.out_dir:                       # previous run's results
+            shutil.rmtree(self.out_dir, ignore_errors=True)
         self.out_dir = tempfile.mkdtemp(prefix='fb_export_')
         env['FB_EXPORT_OUTPUT_DIR'] = self.out_dir
         env['FB_EXPORT_SINCE'] = params['since']
@@ -122,9 +125,7 @@ class ExportJob:
         self.params = params
         self.started_at = datetime.now().isoformat(timespec='seconds')
         self.finished_at = None
-        self.zip_bytes = None
-        self.zip_name = None
-        self.manifest = []
+        self.feed_csv_ready = False
         self.running = True
 
         self.proc = subprocess.Popen(
@@ -146,38 +147,30 @@ class ExportJob:
             if line:
                 with self.lock:
                     self.log.append(line)
+                    # The exporter only starts the pivot build after the feed
+                    # CSV is fully written, so this line marks it complete.
+                    if 'Building pivot workbook' in line:
+                        self.feed_csv_ready = True
         self.proc.wait()
-        self._package()
         with self.lock:
             self.returncode = self.proc.returncode
             self.running = False
             self.finished_at = datetime.now().isoformat(timespec='seconds')
 
-    def _package(self) -> None:
-        """Zip the temp dir into RAM, then delete it — nothing stays on disk.
-
-        Runs even on a non-zero exit so partial results are still
-        downloadable.
-        """
+    def _scan_files(self) -> list[dict]:
+        """Result files with per-file readiness. Callers must hold the lock."""
         files = []
         if self.out_dir and os.path.isdir(self.out_dir):
+            done = self.returncode is not None
             for name in sorted(os.listdir(self.out_dir)):
                 path = os.path.join(self.out_dir, name)
-                if os.path.isfile(path):
-                    files.append((name, path))
-        if files:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for name, path in files:
-                    zf.write(path, arcname=name)
-            with self.lock:
-                self.zip_bytes = buf.getvalue()
-                self.zip_name = f'insightport_export_{datetime.now():%Y-%m-%d_%H%M%S}.zip'
-                self.manifest = [{'name': n, 'size': os.path.getsize(p)}
-                                 for n, p in files]
-        if self.out_dir:
-            shutil.rmtree(self.out_dir, ignore_errors=True)
-            self.out_dir = None
+                if not os.path.isfile(path):
+                    continue
+                ready = done or (self.feed_csv_ready
+                                 and name.startswith('social_feed_insights'))
+                files.append({'name': name, 'size': os.path.getsize(path),
+                              'ready': ready})
+        return files
 
     def stop(self) -> bool:
         if self.proc and self.running:
@@ -195,6 +188,7 @@ class ExportJob:
                 'finished_at': self.finished_at,
                 'log_offset': len(self.log),
                 'log': self.log[since_line:],
+                'files': self._scan_files(),
             }
 
 
@@ -282,48 +276,52 @@ def api_stop():
 
 @app.get('/api/files')
 def api_files():
-    """Manifest of the last run's results — held in memory, not on disk."""
+    """Live manifest of the current/last run's results with readiness flags."""
     with job.lock:
-        return jsonify({
-            'files': job.manifest,
-            'zip_name': job.zip_name,
-            'finished_at': job.finished_at,
-        })
+        return jsonify({'files': job._scan_files(),
+                        'finished_at': job.finished_at})
 
 
 @app.get('/api/download/<path:name>')
 def api_download(name):
-    """Extract one file from the in-memory ZIP and stream it."""
+    """Stream one result file straight from the run's temp dir."""
+    name = os.path.basename(name)          # no path traversal
     with job.lock:
-        blob = job.zip_bytes
-    if not blob:
-        return jsonify({'error': 'No results in memory. Run an export first.'}), 404
-    try:
-        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-            data = zf.read(name)
-    except KeyError:
-        return jsonify({'error': f'{name} not found in results.'}), 404
+        out_dir = job.out_dir
+        ready = {f['name'] for f in job._scan_files() if f['ready']}
+    if not out_dir:
+        return jsonify({'error': 'No results yet. Run an export first.'}), 404
+    path = os.path.join(out_dir, name)
+    if not os.path.isfile(path):
+        return jsonify({'error': f'{name} not found.'}), 404
+    if name not in ready:
+        return jsonify({'error': f'{name} is still being written.'}), 409
     mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
-    return send_file(io.BytesIO(data), mimetype=mime,
-                     as_attachment=True, download_name=name)
+    return send_file(path, mimetype=mime, as_attachment=True,
+                     download_name=name)
 
 
 @app.get('/api/download-all')
 def api_download_all():
-    """Stream the in-memory results ZIP straight to the browser."""
+    """Optional: zip the ready files on the fly (manual button)."""
     with job.lock:
-        blob, zip_name = job.zip_bytes, job.zip_name
-    if not blob:
-        return jsonify({'error': 'No results in memory. Run an export first.'}), 404
-    return send_file(io.BytesIO(blob), mimetype='application/zip',
-                     as_attachment=True,
-                     download_name=zip_name or 'insightport_export.zip')
+        out_dir = job.out_dir
+        files = [f for f in job._scan_files() if f['ready']]
+    if not out_dir or not files:
+        return jsonify({'error': 'No results yet. Run an export first.'}), 404
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(os.path.join(out_dir, f['name']), arcname=f['name'])
+    buf.seek(0)
+    return send_file(buf, mimetype='application/zip', as_attachment=True,
+                     download_name=f'insightport_export_{datetime.now():%Y-%m-%d_%H%M%S}.zip')
 
 
 if __name__ == '__main__':
     host = os.environ.get('HOST', '127.0.0.1')
     port = int(os.environ.get('PORT', 5000))
-    print('📦 Results    : in-memory ZIP only — nothing is saved to disk')
+    print('📦 Results    : streamed per-file to the browser as each is ready')
     print(f'🔑 Token      : {"FB_USER_TOKEN loaded" if get_user_token() else "⚠️ MISSING — add FB_USER_TOKEN to .env"}')
     print(f'🌐 Frontend   : http://{host}:{port}')
     app.run(host=host, port=port, debug=False)

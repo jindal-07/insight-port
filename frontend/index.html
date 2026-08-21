@@ -581,7 +581,7 @@
         </div>
         <div class="status-line">
           <span class="dot" id="dot"></span>
-          <span id="statusText">Idle — results download automatically when the export finishes</span>
+          <span id="statusText">Idle — each result file downloads automatically the moment it's ready</span>
         </div>
       </div>
 
@@ -594,7 +594,7 @@
   </div>
 
   <div class="card c4" id="resultsCard">
-    <h2>Results — in memory, nothing saved to disk
+    <h2>Results — each file downloads as soon as it's ready
       <span class="files-head-actions">
         <button class="btn ripple-host" id="btnZip">Download .zip</button>
         <button class="btn ripple-host" id="btnFiles">Refresh</button>
@@ -856,6 +856,8 @@ let selected = new Set();
 let polling = null;
 let logOffset = 0;
 let wasRunning = false;
+const autoDownloaded = new Set();   // files already sent to the browser this run
+let dlQueue = 0;
 
 // ---------- Material ripple ----------
 document.addEventListener('pointerdown', e => {
@@ -1039,8 +1041,23 @@ async function runExport() {
   $('log').textContent = '';
   logOffset = 0;
   wasRunning = true;
+  autoDownloaded.clear();
+  dlQueue = 0;
   setRunning(true);
   startPolling();
+}
+
+// download each result file the moment the server marks it ready
+function autoDownloadReady(files) {
+  for (const f of files) {
+    if (!f.ready || autoDownloaded.has(f.name)) continue;
+    autoDownloaded.add(f.name);
+    const delay = dlQueue++ * 700;   // stagger so the browser accepts both
+    setTimeout(() => {
+      browserDownload('/api/download/' + encodeURIComponent(f.name));
+      toast(`Downloading ${f.name}`, true);
+    }, delay);
+  }
 }
 
 function setRunning(on) {
@@ -1079,18 +1096,20 @@ async function pollStatus() {
       if (atBottom) el.scrollTop = el.scrollHeight;
     }
 
+    if (j.files) {
+      renderFiles(j.files, j.finished_at);
+      if (wasRunning) autoDownloadReady(j.files);   // per-file streaming
+    }
+
     if (!j.running && j.returncode !== null) {
       if (polling) { clearInterval(polling); polling = null; }
       setRunning(false);
       const ok = j.returncode === 0;
       $('dot').className = 'dot ' + (ok ? 'ok' : 'err');
       $('statusText').textContent = ok
-        ? `Completed ${j.finished_at ? 'at ' + j.finished_at.replace('T', ' ') : ''} — downloading results…`
+        ? `Completed ${j.finished_at ? 'at ' + j.finished_at.replace('T', ' ') : ''} — files downloaded to your browser`
         : `Failed (exit ${j.returncode})`;
-      loadFiles();
       if (ok && wasRunning) {
-        toast('Export complete — downloading ZIP', true);
-        browserDownload('/api/download-all');
         const card = $('resultsCard');
         card.classList.remove('flash'); void card.offsetWidth;
         card.classList.add('flash');
@@ -1112,25 +1131,30 @@ $('btnStop').addEventListener('click', async () => {
 });
 
 // ---------- results ----------
-async function loadFiles() {
-  const r = await fetch('/api/files');
-  const j = await r.json();
+function renderFiles(files, finishedAt) {
   const el = $('files');
-  if (!j.files.length) {
+  if (!files.length) {
     el.innerHTML = '<div class="empty">No results yet — run an export.</div>';
     return;
   }
-  const ran = j.finished_at ? ` · exported ${j.finished_at.replace('T', ' ')}` : '';
+  const ran = finishedAt ? ` · exported ${finishedAt.replace('T', ' ')}` : '';
   let html = `<table><thead><tr><th>File${ran}</th><th>Size</th><th></th></tr></thead><tbody>`;
-  for (const f of j.files) {
+  for (const f of files) {
+    const action = f.ready
+      ? `<a class="dl-btn ripple-host" href="/api/download/${encodeURIComponent(f.name)}" download>${DL_SVG} Download</a>`
+      : `<span class="dim">writing…</span>`;
     html += `<tr>
       <td><span class="fname"><span class="ficon">${fileTag(f.name)}</span>${f.name}</span></td>
       <td class="dim">${fmtSize(f.size)}</td>
-      <td style="text-align:right">
-        <a class="dl-btn ripple-host" href="/api/download/${encodeURIComponent(f.name)}" download>${DL_SVG} Download</a>
-      </td></tr>`;
+      <td style="text-align:right">${action}</td></tr>`;
   }
   el.innerHTML = html + '</tbody></table>';
+}
+
+async function loadFiles() {
+  const r = await fetch('/api/files');
+  const j = await r.json();
+  renderFiles(j.files, j.finished_at);
 }
 $('btnFiles').addEventListener('click', loadFiles);
 $('btnZip').addEventListener('click', () => browserDownload('/api/download-all'));
